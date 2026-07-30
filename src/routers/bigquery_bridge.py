@@ -2,6 +2,7 @@
 import pandas
 import pandas_gbq
 import re
+import time
 import src.mappings as mappings
 import src.config as config
 import src.services.send_mail as send_mail
@@ -38,45 +39,54 @@ class BigqueryBridge(object):
         
     def __get_last_run_timestamp(self):
         """Get the last run timestamp from MSSQL table."""
-        try:
-            with self.__mssql_engine.connect() as connection:
-                if self.__group_code == 'customerpoul':
-                    result = connection.execute(
-                        text("SELECT MAX(createdAt) FROM CustomerPOULBQ")
-                    )
-                    self.__last_run_timestamp = result.scalar()
-                    if self.__last_run_timestamp:
-                        self.__last_run_timestamp = self.__last_run_timestamp + timedelta(seconds=1)  # Add 1 second to avoid fetching the last record again
-                    self.__log(f"Last run timestamp (in UTC): {self.__last_run_timestamp}", level="info")
-                    
-                    result = connection.execute(
-                        text("SELECT MAX(createdAt) FROM CustomerPOULDetailBQ")
-                    )
-                    self.__last_run_timestamp_detail = result.scalar()
-                    if self.__last_run_timestamp_detail:
-                        self.__last_run_timestamp_detail = self.__last_run_timestamp_detail + timedelta(seconds=1)
-                elif self.__group_code == 'customerra':
-                    result = connection.execute(
-                        text("SELECT MAX(createdAt) FROM CustomerRABQ")
-                    )
-                    self.__last_run_timestamp = result.scalar()
+        max_retries = 3
+        retry_delay = 5
 
-                    if self.__last_run_timestamp:
-                        self.__last_run_timestamp = self.__last_run_timestamp + timedelta(seconds=1)
-                    self.__log(f"Last run timestamp for CustomerRA (in UTC): {self.__last_run_timestamp}", level="info")\
-                    
-                    result = connection.execute(
-                        text("SELECT MAX(createdAt) FROM customerRADetailBQ")
-                    )
-                    self.__last_run_timestamp_detail = result.scalar()
+        for attempt in range(max_retries):
+            try:
+                with self.__mssql_engine.connect() as connection:
+                    if self.__group_code == 'customerpoul':
+                        result = connection.execute(
+                            text("SELECT MAX(createdAt) FROM CustomerPOULBQ")
+                        )
+                        self.__last_run_timestamp = result.scalar()
+                        if self.__last_run_timestamp:
+                            self.__last_run_timestamp = self.__last_run_timestamp + timedelta(seconds=1)  # Add 1 second to avoid fetching the last record again
+                        self.__log(f"Last run timestamp (in UTC): {self.__last_run_timestamp}", level="info")
 
-                    if self.__last_run_timestamp_detail:
-                        self.__last_run_timestamp_detail = self.__last_run_timestamp_detail + timedelta(seconds=1)
-            
-        except Exception as e:
-            self.__log(f"Error fetching last run timestamp: {e}", level="error")
-            send_mail.send_mail(self.__log_body, category="ERROR", method=self.__method, module=self.__group_code)
-            return {"status": "error", "message": str(e)}
+                        result = connection.execute(
+                            text("SELECT MAX(createdAt) FROM CustomerPOULDetailBQ")
+                        )
+                        self.__last_run_timestamp_detail = result.scalar()
+                        if self.__last_run_timestamp_detail:
+                            self.__last_run_timestamp_detail = self.__last_run_timestamp_detail + timedelta(seconds=1)
+                    elif self.__group_code == 'customerra':
+                        result = connection.execute(
+                            text("SELECT MAX(createdAt) FROM CustomerRABQ")
+                        )
+                        self.__last_run_timestamp = result.scalar()
+
+                        if self.__last_run_timestamp:
+                            self.__last_run_timestamp = self.__last_run_timestamp + timedelta(seconds=1)
+                        self.__log(f"Last run timestamp for CustomerRA (in UTC): {self.__last_run_timestamp}", level="info")
+
+                        result = connection.execute(
+                            text("SELECT MAX(createdAt) FROM customerRADetailBQ")
+                        )
+                        self.__last_run_timestamp_detail = result.scalar()
+
+                        if self.__last_run_timestamp_detail:
+                            self.__last_run_timestamp_detail = self.__last_run_timestamp_detail + timedelta(seconds=1)
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.__log(f"Connection attempt {attempt + 1} failed: {e}. Retrying in {retry_delay}s...", level="warning")
+                    time.sleep(retry_delay)
+                    self.__mssql_engine = self.__dbconn.get_mssql_engine()
+                else:
+                    self.__log(f"Error fetching last run timestamp: {e}", level="error")
+                    send_mail.send_mail(self.__log_body, category="ERROR", method=self.__method, module=self.__group_code)
+                    return {"status": "error", "message": str(e)}
         
     def __get_bigquery_data(self, table_name):
         """Get data from BigQuery based on the last run timestamp."""
@@ -377,11 +387,15 @@ class BigqueryBridge(object):
                 send_mail.send_mail(self.__log_body, category="ERROR", method=self.__method, module=self.__group_code)
                 return {"status": "error", "message": str(e)}
         
-        send_mail.send_mail(self.__log_body, category="INFO", method=self.__method, module=self.__group_code)
+        total_inserted = len(header_table) + len(detail_table)
+        if total_inserted > 0:
+            send_mail.send_mail(self.__log_body, category="INFO", method=self.__method, module=self.__group_code)
+        else:
+            self.__log("No new entries inserted into target tables. Skipping email notification.", level="info")
         return {
-            "status": "success", 
-            "message": "Data transfer from BigQuery to MSSQL completed successfully.", 
-            "details": {"header_records": len(header_table), 
+            "status": "success",
+            "message": "Data transfer from BigQuery to MSSQL completed successfully.",
+            "details": {"header_records": len(header_table),
                         "detail_records": len(detail_table)}}
 
 if __name__ == "__main__":
